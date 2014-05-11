@@ -36,6 +36,11 @@ namespace :rsync do
     Rake::Task.define_task(:"#{scm}:create_release") do
       invoke :'rsync:release'
     end
+    
+    Rake::Task[:"#{scm}:set_current_revision"].delete
+    Rake::Task.define_task(:"#{scm}:set_current_revision") do
+      #TODO implement me
+    end
   end
 
   desc 'Check that the repository is reachable'
@@ -76,13 +81,60 @@ namespace :rsync do
     end
   end
 
+  desc 'Check for rsync binary on deployment hosts'
+  task :check_remote_binary do
+    on release_roles :all do
+      rsync_cmd_avail = test 'rsync --version'
+
+      # finish task if rsync found
+      next if rsync_cmd_avail
+
+      # build paths
+      rsync_path = File.join fetch(:deploy_to), 'shared', 'deploy_bin'
+      rsync_path_to = File.join rsync_path, 'rsync'
+      rsync_path_from = File.expand_path(File.join(
+       File.expand_path(File.dirname(__FILE__)),
+       '../../../share/rsync_static/rsync_x64'
+      ))
+
+      rsync_cmd_avail = test  :test, '-x', rsync_path_to
+
+      # finish task if a already uploaded rsync is found
+      if not rsync_cmd_avail
+        # create dir
+        execute :mkdir, '-p', rsync_path
+
+        # Upload rsync binary to server
+        upload! rsync_path_from, rsync_path_to
+
+        # Max rsync executable
+        execute :chmod, '+x', rsync_path_to
+      end
+
+      set :rsync_remote_path, rsync_path_to
+    end
+  end
+
   desc 'Sync to deployment hosts from local'
-  task sync: :'rsync:stage' do
+  task :sync => ['rsync:stage','rsync:check_remote_binary'] do
     last_rsync_to = nil
     roles(:all).each do |role|
       run_locally do
         user = "#{role.user}@" if !role.user.nil?
         rsync_options = "#{fetch(:rsync_options).join(' ')}"
+
+        password = fetch(:ssh_options)[:password]
+        
+        # Use sshpass if password is given
+        if not password.nil? 
+          rsync_options += " -e \"sshpass -p #{password} ssh -o PubkeyAuthentication=no\"" 
+        end
+
+        # Use different remote rsync path
+        if not fetch(:rsync_remote_path).nil?
+          rsync_options += " --rsync-path \"#{fetch(:rsync_remote_path)}\""
+        end
+
         rsync_from = "#{fetch(:rsync_src)}/"
         rsync_to = "#{user}#{role.hostname}:#{fetch(:rsync_dest_fullpath) || release_path}"
 
@@ -99,7 +151,12 @@ namespace :rsync do
     next if !fetch(:rsync_dest)
 
     on release_roles :all do
-      execute :rsync,
+      if fetch(:rsync_remote_path).nil?
+        rsync_path = :rsync
+      else
+        rsync_path = fetch(:rsync_remote_path)
+      end
+      execute rsync_path,
         "#{fetch(:rsync_copy_options).join(' ')}",
         "#{fetch(:rsync_dest_fullpath)}/",
         "#{release_path}/"
